@@ -3,7 +3,8 @@ import logging
 from pathlib import Path
 from docx import Document
 from pypdf import PdfReader
-from app.aws import client, embed
+from app.aws import client
+from app.llm import embed_many
 from app.vector import upsert
 from app.config import settings
 from app.db import connection, audit
@@ -25,7 +26,6 @@ def parse(blob:bytes, suffix:str):
     return [(1,blob.decode('utf-8'))]
 
 
-
 def chunks(text, size=1200, overlap=180):
     text=' '.join(text.split())
     pos=0
@@ -33,8 +33,6 @@ def chunks(text, size=1200, overlap=180):
         yield text[pos:pos+size]
         if pos+size>=len(text): break
         pos+=size-overlap
-
-
 
 
 @trace("process_s3_key")
@@ -54,12 +52,13 @@ def process_s3_key(key):
         pages=parse(blob,Path(key).suffix.lower())
         parts=[(page,part) for page,text in pages for part in chunks(text)]
         if not parts: raise ValueError('No extractable text; scanned PDFs need Textract OCR')
-        vectors=[]
-        for i,(page,part) in enumerate(parts):
-            vectors.append({'id':f'{doc["id"]}:{doc["current_version"]}:{i}',
-                'values':embed(part),'metadata':{'document_id':str(doc['id']),
-                'title':doc['title'],'page':page,'text':part,
-                'owner_sub':doc['owner_sub'],'allowed_groups':doc['allowed_groups']}})
+        values=embed_many([part for _,part in parts])
+        vectors=[{'id':f'{doc["id"]}:{doc["current_version"]}:{i}',
+                  'values':values[i],
+                  'metadata':{'document_id':str(doc['id']),'title':doc['title'],
+                              'page':page,'text':part,'owner_sub':doc['owner_sub'],
+                              'allowed_groups':doc['allowed_groups']}}
+                 for i,(page,part) in enumerate(parts)]
         # Keep batches small; Pinecone metadata must fit the index's limits.
         for i in range(0,len(vectors),50): upsert(doc['tenant_id'],vectors[i:i+50])
         with connection() as conn:

@@ -12,3 +12,4 @@ langgraph>=0.2,<2
 pinecone>=5,<9
 python-dotenv==1.2.1
 glassflow-rius>=1.0,<2.0
+google-genai

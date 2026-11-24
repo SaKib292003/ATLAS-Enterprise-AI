@@ -9,6 +9,11 @@ from app.config import settings
 log = logging.getLogger(__name__)
 
 
+def _is_ready(pc, name):
+    status = pc.describe_index(name).status
+    return bool(status['ready'] if isinstance(status, dict) else status.ready)
+
+
 @lru_cache(maxsize=1)
 def index():
     """Return an initialized Pinecone index. Safe for repeated requests in one process."""
@@ -19,41 +24,38 @@ def index():
         raise RuntimeError("PINECONE_INDEX_NAME is missing from .env")
     pc = Pinecone(api_key=s.pinecone_api_key)
     name = s.pinecone_index_name
-    # Describe rather than list: avoids listing every index and works for existing indexes.
-    try:
-        info = pc.describe_index(name)
-    except Exception as exc:
-        # Only create on an actual 404; never hide auth/network failures.
-        if getattr(exc, 'status', None) != 404:
-            raise
+    if not pc.has_index(name):
         log.info('Creating Pinecone index %s (dimension=%d, metric=cosine)', name, s.embed_dim)
         try:
             pc.create_index(name=name, dimension=s.embed_dim, metric='cosine',
                 spec=ServerlessSpec(cloud=s.pinecone_cloud, region=s.pinecone_region))
         except Exception as create_exc:
             # Another process may have created the index concurrently.
-            if getattr(create_exc, 'status', None) != 409:
+            if getattr(create_exc, 'status', None) != 409 and 'already exists' not in str(create_exc).lower():
                 raise
-        info = pc.describe_index(name)
+    info = pc.describe_index(name)
     if int(info.dimension) != s.embed_dim:
         raise ValueError(f'Pinecone index {name} dimension={info.dimension}, expected {s.embed_dim}. '
                          'Use a different index name or matching EMBED_DIM.')
     if str(info.metric).lower() != 'cosine':
         raise ValueError(f'Pinecone index {name} must use cosine metric, got {info.metric}')
     deadline = time.monotonic() + s.pinecone_ready_timeout
-    while not pc.describe_index(name).status['ready']:
+    while not _is_ready(pc, name):
         if time.monotonic() >= deadline:
             raise TimeoutError(f'Pinecone index {name} was not ready within {s.pinecone_ready_timeout}s')
         time.sleep(3)
     log.info('Pinecone index %s ready', name)
     return pc.Index(name)
 
+
 def namespace(tenant):
     return 'tenant-' + tenant
+
 
 @trace("upsert")
 def upsert(tenant, records):
     return index().upsert(vectors=records, namespace=namespace(tenant))
+
 
 @trace("search")
 def search(tenant, vector, groups, owner, limit=5):
@@ -63,6 +65,7 @@ def search(tenant, vector, groups, owner, limit=5):
                            namespace=namespace(tenant), filter=acl)
     return [{'id': m.id, 'score': m.score, 'metadata': m.metadata or {}}
             for m in result.matches]
+
 
 def delete_document(tenant, ids):
     if ids:
